@@ -325,3 +325,5 @@ func file_stc_mutex_proto_init() {
 	file_stc_mutex_proto_goTypes = nil
 	file_stc_mutex_proto_depIdxs = nil
 }
+
+// :)

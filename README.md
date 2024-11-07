@@ -19,16 +19,18 @@ go build -o mutex
 
 Start multiple nodes with different IDs and addresses:
 
-```bash
+```zsh
 # Start first node
-./mutex -id node1 -addr localhost:5001
+./mutex -id node1 -addr localhost:5001 -peers node2@localhost:5002,node3@localhost:5003
 
 # Start second node
-./mutex -id node2 -addr localhost:5002 -peers node1@localhost:5001
+./mutex -id node2 -addr localhost:5002 -peers node1@localhost:5001,node3@localhost:5003
 
 # Start third node
 ./mutex -id node3 -addr localhost:5003 -peers node1@localhost:5001,node2@localhost:5002
 ```
+
+Make sure that all peers have correct refferences to eachother or there will be side effects.
 
 ## Algorithm Description
 
@@ -73,3 +75,6 @@ Node1: Leaving critical section with Lamport timestamp 5
 ```
 
 This demonstrates how Lamport timestamps maintain causality and ensure fair ordering of critical section access requests.
+
+
+:)

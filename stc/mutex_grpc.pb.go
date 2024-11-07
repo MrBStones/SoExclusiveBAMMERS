@@ -157,3 +157,6 @@ var MutexService_ServiceDesc = grpc.ServiceDesc{
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "stc/mutex.proto",
 }
+
+
+// :)
