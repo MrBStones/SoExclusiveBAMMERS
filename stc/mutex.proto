@@ -1,0 +1,24 @@
+syntax = "proto3";
+option go_package = "mutex.proto";
+
+service MutexService {
+  rpc RequestAccess (AccessRequest) returns (AccessResponse) {}
+  rpc ReleaseAccess (ReleaseRequest) returns (ReleaseResponse) {}
+}
+
+message AccessRequest {
+  string node_id = 1;
+  int64 timestamp = 2;
+}
+
+message AccessResponse {
+  bool granted = 1;
+}
+
+message ReleaseRequest {
+  string node_id = 1;
+}
+
+message ReleaseResponse {
+  bool acknowledged = 1;
+}
