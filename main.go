@@ -51,7 +51,7 @@ func main() {
 			peerID, peerAddr := parts[0], parts[1]
 
 			// Wait a bit for other nodes to start
-			time.Sleep(time.Second)
+			time.Sleep(time.Second * 2)
 			if err := n.ConnectToPeer(peerID, peerAddr); err != nil {
 				log.Printf("Failed to connect to peer %s: %v", peerID, err)
 			}
@@ -60,7 +60,7 @@ func main() {
 
 	// Periodically request critical section access
 	for {
-		time.Sleep(5 * time.Second)
+		time.Sleep(1 * time.Second)
 		n.RequestCriticalSection()
 	}
 }

@@ -1,11 +1,11 @@
 package peer
 
 import (
+	"container/list"
 	"context"
 	"fmt"
 	"log"
 	pb "mutex/stc"
-	"sort"
 	"sync"
 	"time"
 
@@ -13,54 +13,36 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-type Request struct {
-	NodeID    string
-	Timestamp uint64
-}
-
 type Node struct {
 	ID                string
 	Address           string
 	Peers             map[string]pb.MutexServiceClient
 	LamportClock      uint64
-	WantCS            bool
-	InCS              bool
-	RequestQueue      []Request
-	DeferredResponses map[string]bool
+	WantCS            bool // state == WANTED;
+	InCS              bool // state == HELD; state == RELEASED if neither is true;
+	DeferredResponses *list.List
 	ResponseCount     int
-	CurrentRequest    *Request
-	mu                sync.Mutex
+	CurrentRequest    *pb.AccessRequest
+	ReqMu             sync.Mutex
+	LamMu             sync.Mutex
+	CsMu              sync.Mutex
+	Release           (chan bool)
 	pb.UnimplementedMutexServiceServer
 }
 
+// --- initialization functions ---
 func NewNode(id, address string) *Node {
 	return &Node{
 		ID:                id,
 		Address:           address,
 		Peers:             make(map[string]pb.MutexServiceClient),
 		LamportClock:      0,
-		RequestQueue:      make([]Request, 0),
-		DeferredResponses: make(map[string]bool),
+		DeferredResponses: list.New(),
+		Release:           make(chan bool, 1),
 	}
-}
-
-func (n *Node) UpdateLamportClock(msgTimestamp uint64) uint64 {
-
-	// Same as: clock = max(local_clock, msg_timestamp) + 1
-	if msgTimestamp > n.LamportClock {
-		n.LamportClock = msgTimestamp
-	}
-	n.LamportClock++
-	return n.LamportClock
-}
-
-func (n *Node) GetLamportClock() uint64 {
-	n.LamportClock++
-	return n.LamportClock
 }
 
 func (n *Node) ConnectToPeer(peerID, peerAddr string) error {
-
 	conn, err := grpc.NewClient(peerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return fmt.Errorf("failed to connect to peer %s: %v", peerID, err)
@@ -71,51 +53,24 @@ func (n *Node) ConnectToPeer(peerID, peerAddr string) error {
 	return nil
 }
 
+// --- Server functions ---
 func (n *Node) RequestAccess(ctx context.Context, req *pb.AccessRequest) (*pb.AccessResponse, error) {
+	n.ReqMu.Lock()
+	defer n.ReqMu.Unlock()
 
 	// Update Lamport clock on message receipt
 	timestamp := n.UpdateLamportClock(req.LamportTimestamp)
 
 	log.Printf("Node %s received request from %s with Lamport timestamp %d", n.ID, req.NodeId, req.LamportTimestamp)
 
-	// Add request to queue
-	n.RequestQueue = append(n.RequestQueue, Request{
-		NodeID:    req.NodeId,
-		Timestamp: req.LamportTimestamp,
-	})
-
-	// Sort queue by timestamp and node ID
-	sort.Slice(n.RequestQueue, func(i, j int) bool {
-		if n.RequestQueue[i].Timestamp == n.RequestQueue[j].Timestamp {
-			return n.RequestQueue[i].NodeID < n.RequestQueue[j].NodeID
-		}
-		return n.RequestQueue[i].Timestamp < n.RequestQueue[j].Timestamp
-	})
-
-	if n.InCS || (n.WantCS && n.isHigherPriority(n.CurrentRequest, &Request{
-		NodeID:    req.NodeId,
-		Timestamp: req.LamportTimestamp,
-	})) {
-		n.DeferredResponses[req.NodeId] = true
+	if n.InCS || (n.WantCS && n.isHigherPriority(n.CurrentRequest, req)) {
+		n.DeferredResponses.PushBack(req.NodeId)
 		log.Printf("Node %s deferring response to %s", n.ID, req.NodeId)
-		return &pb.AccessResponse{
-			Granted:          false,
-			LamportTimestamp: timestamp,
-		}, nil
+		return &pb.AccessResponse{Granted: false, LamportTimestamp: timestamp}, nil
 	}
 
-	return &pb.AccessResponse{Granted: true,
-		LamportTimestamp: timestamp}, nil
-}
-
-func (n *Node) isHigherPriority(req1, req2 *Request) bool {
-	if req1 == nil || req2 == nil {
-		return false
-	}
-	if req1.Timestamp == req2.Timestamp {
-		return req1.NodeID < req2.NodeID
-	}
-	return req1.Timestamp < req2.Timestamp
+	defer n.SendReleaseMSG(req.NodeId, n.Peers[req.NodeId], timestamp) // actual message that matters
+	return &pb.AccessResponse{Granted: false, LamportTimestamp: timestamp}, nil
 }
 
 func (n *Node) ReleaseAccess(ctx context.Context, req *pb.ReleaseRequest) (*pb.ReleaseResponse, error) {
@@ -123,75 +78,52 @@ func (n *Node) ReleaseAccess(ctx context.Context, req *pb.ReleaseRequest) (*pb.R
 	// Update Lamport clock on release message
 	timestamp := n.UpdateLamportClock(req.LamportTimestamp)
 
-	log.Printf("Node %s received release from %s with Lamport timestamp %d",
-		n.ID, req.NodeId, req.LamportTimestamp)
+	log.Printf("Node %s received release from %s with Lamport timestamp %d", n.ID, req.NodeId, req.LamportTimestamp)
+	n.Release <- true
 
-	// Remove the released request from queue
-	for i := 0; i < len(n.RequestQueue); i++ {
-		if n.RequestQueue[i].NodeID == req.NodeId {
-			n.RequestQueue = append(n.RequestQueue[:i], n.RequestQueue[i+1:]...)
-			break
-		}
-	}
-
-	// Process next request in queue if we have one
-	if len(n.RequestQueue) > 0 && !n.WantCS {
-		nextReq := n.RequestQueue[0]
-		if client, ok := n.Peers[nextReq.NodeID]; ok {
-			go func() {
-				_, err := client.RequestAccess(context.Background(), &pb.AccessRequest{
-					NodeId:           n.ID,
-					LamportTimestamp: n.GetLamportClock(),
-				})
-				if err != nil {
-					log.Printf("Error sending deferred response to %s: %v", nextReq.NodeID, err)
-				}
-			}()
-		}
-	}
-
-	return &pb.ReleaseResponse{Acknowledged: true,
-		LamportTimestamp: timestamp}, nil
+	return &pb.ReleaseResponse{Acknowledged: true, LamportTimestamp: timestamp}, nil
 }
 
+// --- client functions ---
 func (n *Node) RequestCriticalSection() {
+	n.CsMu.Lock()
+	defer n.CsMu.Unlock()
 	if n.InCS || n.WantCS {
 		return
 	}
 
 	n.WantCS = true
 	timestamp := n.GetLamportClock()
-	n.CurrentRequest = &Request{
-		NodeID:    n.ID,
-		Timestamp: timestamp,
+	n.CurrentRequest = &pb.AccessRequest{
+		NodeId:           n.ID,
+		LamportTimestamp: timestamp,
 	}
 	n.ResponseCount = 0
 
-	log.Printf("Node %s requesting critical section access with Lamport timestamp %d",
-		n.ID, timestamp)
+	log.Printf("Node %s requesting critical section access with Lamport timestamp %d", n.ID, timestamp)
 
 	responses := make(chan bool, len(n.Peers))
 
 	// Request access from all peers
 	for peerID, client := range n.Peers {
 		go func(id string, c pb.MutexServiceClient) {
-			resp, err := c.RequestAccess(context.Background(), &pb.AccessRequest{
-				NodeId:           n.ID,
-				LamportTimestamp: timestamp,
-			})
+			log.Printf("Requesting access from %s", peerID)
+			resp, err := c.RequestAccess(context.Background(), n.CurrentRequest)
 
 			if err != nil {
 				log.Printf("Error requesting access from %s: %v", id, err)
 				responses <- false
 				return
 			}
-
+			log.Printf("Finished requesting access from %s", peerID)
 			n.UpdateLamportClock(resp.LamportTimestamp)
-			responses <- resp.Granted
+			responses <- <-n.Release
+
 		}(peerID, client)
 	}
 
 	// Wait for all responses
+	log.Printf("Node %s is waiting for %d releases", n.ID, len(n.Peers))
 	granted := 0
 	needed := len(n.Peers)
 
@@ -201,18 +133,14 @@ func (n *Node) RequestCriticalSection() {
 		}
 	}
 
-	if granted == needed {
-		n.InCS = true
-		n.ExecuteCriticalSection()
-	} else {
-		n.WantCS = false
-	}
+	n.ExecuteCriticalSection()
+
 }
 
 func (n *Node) ExecuteCriticalSection() {
-	log.Printf("Node %s entering critical section with Lamport timestamp %d",
-		n.ID, n.LamportClock)
 
+	log.Printf("Node %s entering critical section with Lamport timestamp %d", n.ID, n.LamportClock)
+	n.InCS = true
 	// Simulate critical section work
 	time.Sleep(2 * time.Second)
 
@@ -220,37 +148,57 @@ func (n *Node) ExecuteCriticalSection() {
 	n.WantCS = false
 	releaseTimestamp := n.GetLamportClock()
 
-	log.Printf("Node %s leaving critical section with Lamport timestamp %d",
-		n.ID, releaseTimestamp)
+	log.Printf("Node %s leaving critical section with Lamport timestamp %d", n.ID, releaseTimestamp)
 
-	// Send release to all peers
-	for peerID, client := range n.Peers {
-		go func(id string, c pb.MutexServiceClient) {
-			_, err := c.ReleaseAccess(context.Background(), &pb.ReleaseRequest{
-				NodeId:           n.ID,
-				LamportTimestamp: releaseTimestamp,
-			})
-			if err != nil {
-				log.Printf("Error sending release to %s: %v", id, err)
-			}
-		}(peerID, client)
-	}
+	// Send release to all peers in defered
+	log.Printf("Node %s sending %d Defered responses with Lamport timestamp %d", n.ID, n.DeferredResponses.Len(), releaseTimestamp)
+	for n.DeferredResponses.Len() > 0 {
+		front := n.DeferredResponses.Front()
 
-	// Clear current request and process next in queue
-	n.CurrentRequest = nil
-	if len(n.RequestQueue) > 0 {
-		nextReq := n.RequestQueue[0]
-		n.RequestQueue = n.RequestQueue[1:]
-		if client, ok := n.Peers[nextReq.NodeID]; ok {
-			go func() {
-				_, err := client.RequestAccess(context.Background(), &pb.AccessRequest{
-					NodeId:           n.ID,
-					LamportTimestamp: n.GetLamportClock(),
-				})
-				if err != nil {
-					log.Printf("Error processing next request for %s: %v", nextReq.NodeID, err)
-				}
-			}()
-		}
+		peerID := front.Value.(string)
+		client := n.Peers[peerID]
+		n.SendReleaseMSG(peerID, client, releaseTimestamp)
+
+		n.DeferredResponses.Remove(front)
 	}
+}
+
+// --- util functions ---
+func (n *Node) UpdateLamportClock(msgTimestamp uint64) uint64 {
+	n.LamMu.Lock()
+	// Same as: clock = max(local_clock, msg_timestamp) + 1
+	if msgTimestamp > n.LamportClock {
+		n.LamportClock = msgTimestamp
+	}
+	n.LamportClock++
+	n.LamMu.Unlock()
+	return n.LamportClock
+}
+
+func (n *Node) GetLamportClock() uint64 {
+	n.LamMu.Lock()
+	n.LamportClock++
+	n.LamMu.Unlock()
+	return n.LamportClock
+}
+
+func (n *Node) isHigherPriority(req1, req2 *pb.AccessRequest) bool {
+	if req1 == nil || req2 == nil {
+		return false
+	}
+	if req1.LamportTimestamp == req2.LamportTimestamp {
+		return req1.NodeId < req2.NodeId
+	}
+	return req1.LamportTimestamp < req2.LamportTimestamp
+}
+
+func (n *Node) SendReleaseMSG(peerID string, client pb.MutexServiceClient, releaseTimestamp uint64) {
+	_, err := client.ReleaseAccess(context.Background(), &pb.ReleaseRequest{
+		NodeId:           n.ID,
+		LamportTimestamp: releaseTimestamp,
+	})
+	if err != nil {
+		log.Printf("Error sending release to %s: %v", peerID, err)
+	}
+	log.Printf("Node %s granting %s access to CS", n.ID, peerID)
 }
