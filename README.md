@@ -35,7 +35,7 @@ Make sure that all peers have correct refferences to eachother or there will be 
 ## Algorithm Description
 
 
-The implementation uses a modified version of the Ricart-Agrawala algorithm with Lamport timestamps for distributed mutual exclusion:
+The implementation uses a version of the Ricart-Agrawala algorithm with Lamport timestamps for distributed mutual exclusion:
 
 1. Each node maintains a Lamport logical clock that:
    - Increments on each local event
